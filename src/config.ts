@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { z } from 'zod';
+import { mediaSecretOrRandom } from './media.js';
 
 /**
  * Everything the addon is configured with, read once at boot.
@@ -32,6 +33,16 @@ export type Config = {
     batchSize: number;
     maxBytes: number;
   };
+  /**
+   * Serve audio through this server instead of handing over TorBox's presigned URL.
+   * Off by default: direct is faster and costs no bandwidth here. Turned on when the
+   * CDN URL is not directly playable (extensionless / header-gated).
+   */
+  media: {
+    proxy: boolean;
+    secret: string;
+    ttlSeconds: number;
+  };
   syncIntervalMinutes: number;
 };
 
@@ -52,6 +63,9 @@ const Raw = z.object({
   MAX_ALBUMS_PER_HOUR: z.coerce.number().int().min(0).default(6),
   MIN_SEEDERS: z.coerce.number().int().min(0).default(1),
   MAX_ALBUM_GB: z.coerce.number().min(0).default(8),
+  MEDIA_PROXY: z.string().default('0'),
+  MEDIA_SECRET: z.string().optional(),
+  MEDIA_TTL_SECONDS: z.coerce.number().int().min(300).max(86_400).default(1800),
   PROBE_BATCH: z.coerce.number().int().min(0).default(40),
   PROBE_MAX_BYTES: z.coerce.number().int().min(8192).default(524288),
   SYNC_INTERVAL_MINUTES: z.coerce.number().int().min(0).default(360),
@@ -133,6 +147,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     probe: {
       batchSize: v.PROBE_BATCH,
       maxBytes: v.PROBE_MAX_BYTES,
+    },
+    media: {
+      proxy: v.MEDIA_PROXY === '1' || v.MEDIA_PROXY.toLowerCase() === 'true',
+      secret: mediaSecretOrRandom(v.MEDIA_SECRET),
+      ttlSeconds: v.MEDIA_TTL_SECONDS,
     },
     syncIntervalMinutes: v.SYNC_INTERVAL_MINUTES,
   };

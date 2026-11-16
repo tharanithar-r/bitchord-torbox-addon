@@ -1,6 +1,7 @@
 import type { Logger } from 'pino';
 import { parseTrackId, type Store, type TrackRow } from '../db.js';
 import type { Prober } from '../probe/worker.js';
+import { extensionFor } from '../media.js';
 import { TorBoxError, type TorBoxClient } from '../torbox.js';
 import { normalizeTier } from './search.js';
 
@@ -33,6 +34,12 @@ export type StreamDeps = {
   log: Logger;
   cache: LinkCache;
   onMiss?: (track: TrackRow) => void;
+  /**
+   * Present when audio is served through this addon (MEDIA_PROXY=1). Then no TorBox
+   * link is minted here at all: the answer points at our own signed route, which
+   * mints one at fetch time. That also makes this answer instant.
+   */
+  media?: { url(id: string, ext: string): string };
 };
 
 export type StreamAnswer = {
@@ -75,6 +82,11 @@ export async function resolveStream(
     });
   }
 
+  if (deps.media) {
+    const ext = extensionFor({ codec: track.codec, format: track.format });
+    return { status: 200, headers: {}, body: streamBody(track, deps.media.url(track.id, ext)) };
+  }
+
   let url = cachedLink(deps.cache, track.id);
   if (!url) {
     try {
@@ -96,6 +108,19 @@ export async function resolveStream(
   }
 
   return { status: 200, headers: {}, body: streamBody(track, url) };
+}
+
+/** A link already minted for this track, or a fresh one, remembered for reuse. */
+export async function linkFor(
+  cache: LinkCache,
+  id: string,
+  mint: () => Promise<string>,
+): Promise<string> {
+  const hit = cachedLink(cache, id);
+  if (hit) return hit;
+  const url = await mint();
+  cache.set(id, { url, at: Date.now() });
+  return url;
 }
 
 function cachedLink(cache: LinkCache, id: string): string | null {

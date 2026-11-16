@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { Acquisition } from '../src/acquire/queue.js';
 import { createApp } from '../src/app.js';
 import type { AuthObserver } from '../src/auth/bitchord.js';
 import type { Config } from '../src/config.js';
@@ -21,6 +22,7 @@ function config(): Config {
     logLevel: 'silent',
     acquire: { enabled: false, allowUncached: false, maxAlbumsPerHour: 0, minSeeders: 1, maxAlbumGb: 8 },
     probe: { batchSize: 0, maxBytes: 524288 },
+    media: { proxy: false, secret: 'test-media-secret-0123456789', ttlSeconds: 1800 },
     syncIntervalMinutes: 0,
   };
 }
@@ -237,6 +239,34 @@ describe('stream', () => {
     store.close();
   });
 
+  it('describes a miss that acquisition is working on, in the app\'s own debrid shape', async () => {
+    const store = seededStore();
+    const acquisition = {
+      queueForTrack: async () => 1,
+      budgetLeft: () => 6,
+    } as unknown as Acquisition;
+    const app = createApp({
+      cfg: config(),
+      store,
+      log: createLogger('silent'),
+      auth: stubAuth(),
+      torbox: fakeTorbox(),
+      acquisition,
+    });
+    const response = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/stream/${encodeURIComponent(trackId('torrents', 99, 99))}`,
+    });
+    // Still a 404 (a failure is not cached, so the next play asks again), with the
+    // forward-compatible retry hint BitChord's issue #1523 defines.
+    expect(response.statusCode).toBe(404);
+    const body = response.json() as Record<string, unknown>;
+    expect(body.retryAfter).toBe(30);
+    expect(String(body.error)).toContain('TorBox');
+    await app.close();
+    store.close();
+  });
+
   it('answers 503 when no TorBox key is configured', async () => {
     const store = seededStore();
     // Built directly: passing `undefined` to appWith() would hit its default parameter.
@@ -294,6 +324,130 @@ describe('stream latency and declarations', () => {
     // AAC or ALAC — only the file settles it, so nothing is claimed.
     expect(codecFromFormat('m4a')).toBeUndefined();
     expect(codecFromFormat('unknown', true)).toBe('flac');
+  });
+});
+
+describe('signed media route (MEDIA_PROXY=1)', () => {
+  const mediaConfig = (): Config => ({
+    ...config(),
+    media: { proxy: true, secret: 'test-media-secret-0123456789', ttlSeconds: 1800 },
+  });
+
+  function fakeCdn(): { impl: typeof fetch; calls: Array<{ url: string; range?: string }> } {
+    const calls: Array<{ url: string; range?: string }> = [];
+    const impl = (async (url: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({ url: String(url), range: headers.range });
+      return new Response(new Uint8Array([0x66, 0x4c, 0x61, 0x43]), {
+        status: 206,
+        headers: {
+          'content-type': 'audio/flac',
+          'content-range': 'bytes 0-3/1000',
+          'content-length': '4',
+        },
+      });
+    }) as unknown as typeof fetch;
+    return { impl, calls };
+  }
+
+  it('answers with its own signed URL instead of the CDN one, and instantly', async () => {
+    const store = seededStore();
+    const app = createApp({
+      cfg: mediaConfig(),
+      store,
+      log: createLogger('silent'),
+      auth: stubAuth(),
+      torbox: fakeTorbox(),
+      fetchImpl: fakeCdn().impl,
+    });
+    const began = Date.now();
+    const response = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/stream/${encodeURIComponent(trackId('torrents', 1, 2))}?quality=max`,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(Date.now() - began).toBeLessThan(500);
+    const body = response.json() as Record<string, unknown>;
+    // Extension on the path is the whole point: the player infers the container.
+    expect(String(body.url)).toMatch(/\/media\/t%3A1%3A2\.flac\?exp=\d+&sig=[A-Za-z0-9_-]+$/);
+    expect(body.codec).toBe('flac');
+    await app.close();
+    store.close();
+  });
+
+  it('serves the bytes and forwards the player Range header upstream', async () => {
+    const store = seededStore();
+    const cdn = fakeCdn();
+    // Counts *link mints*, which is what the 300/min API budget is spent on.
+    let mints = 0;
+    const countingTorbox = {
+      requestLink: async () => {
+        mints += 1;
+        return 'https://cdn.torbox.example/media.flac';
+      },
+    } as unknown as TorBoxClient;
+    const app = createApp({
+      cfg: mediaConfig(),
+      store,
+      log: createLogger('silent'),
+      auth: stubAuth(),
+      torbox: countingTorbox,
+      fetchImpl: cdn.impl,
+    });
+    const stream = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/stream/${encodeURIComponent(trackId('torrents', 1, 2))}`,
+    });
+    const mediaUrl = new URL(String((stream.json() as Record<string, unknown>).url));
+    const served = await app.inject({
+      method: 'GET',
+      url: `${mediaUrl.pathname}${mediaUrl.search}`,
+      headers: { range: 'bytes=0-3' },
+    });
+    expect(served.statusCode).toBe(206);
+    expect(served.headers['content-type']).toBe('audio/flac');
+    expect(served.headers['content-range']).toBe('bytes 0-3/1000');
+    expect(served.rawPayload.subarray(0, 4).toString('latin1')).toBe('fLaC');
+    expect(cdn.calls[0]?.range).toBe('bytes=0-3');
+
+    // A player seeks constantly; each ranged read must not cost another API call.
+    await app.inject({
+      method: 'GET',
+      url: `${mediaUrl.pathname}${mediaUrl.search}`,
+      headers: { range: 'bytes=500-999' },
+    });
+    expect(cdn.calls).toHaveLength(2); // two upstream reads…
+    expect(mints).toBe(1); // …one minted link
+    await app.close();
+    store.close();
+  });
+
+  it('refuses a wrong or expired signature without touching TorBox', async () => {
+    const store = seededStore();
+    const cdn = fakeCdn();
+    const app = createApp({
+      cfg: mediaConfig(),
+      store,
+      log: createLogger('silent'),
+      auth: stubAuth(),
+      torbox: fakeTorbox(),
+      fetchImpl: cdn.impl,
+    });
+    const file = `${encodeURIComponent(trackId('torrents', 1, 2))}.flac`;
+    const forged = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/media/${file}?exp=${Math.floor(Date.now() / 1000) + 600}&sig=not-a-real-signature`,
+    });
+    expect(forged.statusCode).toBe(403);
+
+    const expired = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/media/${file}?exp=1&sig=whatever`,
+    });
+    expect(expired.statusCode).toBe(403);
+    expect(cdn.calls).toHaveLength(0);
+    await app.close();
+    store.close();
   });
 });
 

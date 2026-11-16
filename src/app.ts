@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import Fastify, {
   LogController,
   type FastifyBaseLogger,
@@ -11,13 +12,14 @@ import type { AuthObserver } from './auth/bitchord.js';
 import type { Config } from './config.js';
 import type { Store } from './db.js';
 import { CORS_HEADERS, htmlBody, jsonBody } from './http.js';
+import { contentTypeFor, mediaUrl, verifyMedia } from './media.js';
 import { redactUrl } from './log.js';
 import { tokenize } from './parse.js';
 import type { Prober } from './probe/worker.js';
 import { adminPage, healthBody } from './routes/admin.js';
 import { ADDON_VERSION, buildManifest } from './routes/manifest.js';
 import { hasUsableQuery, normalizeTier, rankRows, toAddonTrack } from './routes/search.js';
-import { qualityLabel, resolveStream, type LinkCache } from './routes/stream.js';
+import { linkFor, qualityLabel, resolveStream, type LinkCache } from './routes/stream.js';
 import type { Sync } from './sync.js';
 import type { TorBoxClient } from './torbox.js';
 
@@ -38,7 +40,13 @@ export type AppDeps = {
   prober?: Prober;
   acquisition?: Acquisition;
   sync?: Sync;
+  /** Injected so the media route can be tested without a network. */
+  fetchImpl?: typeof fetch;
 };
+
+/** The miss wording `resolveStream` uses, so the retry hint can be attached to it. */
+const NOT_HELD = 'Not held by this addon';
+const RETRY_AFTER_SECONDS = 30;
 
 export function createApp(deps: AppDeps): FastifyInstance {
   const app = Fastify({
@@ -53,6 +61,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
     trustProxy: true,
   });
   const cache: LinkCache = new Map();
+  const fetchImpl = deps.fetchImpl ?? fetch;
   const manifest = buildManifest(deps.cfg);
   const base = `/${deps.cfg.pathSecret}`;
 
@@ -148,6 +157,19 @@ export function createApp(deps: AppDeps): FastifyInstance {
           prober: deps.prober,
           log: deps.log,
           cache,
+          media: deps.cfg.media.proxy
+            ? {
+                url: (id: string, ext: string) =>
+                  mediaUrl({
+                    host: deps.cfg.publicHosts[0] ?? 'localhost',
+                    basePath: deps.cfg.pathSecret,
+                    id,
+                    ext,
+                    exp: Math.floor(Date.now() / 1000) + deps.cfg.media.ttlSeconds,
+                    secret: deps.cfg.media.secret,
+                  }),
+              }
+            : undefined,
           onMiss: (track) => {
             // Silent by design: BitChord has no notice channel, so a miss is a miss
             // this time and a track that exists shortly afterwards.
@@ -160,9 +182,96 @@ export function createApp(deps: AppDeps): FastifyInstance {
         request.params.id,
         { quality: request.query.quality, atmos: request.query.atmos },
       );
+
+      // A miss that acquisition is working on is worth describing. BitChord's
+      // own design for debrid addons (issue #1523) reads `retryAfter` on an
+      // answer with no URL and asks again while the track plays; releases that
+      // predate it ignore the field, and a 404 is not cached either way, so the
+      // next play asks again regardless.
+      if (answer.status === 404 && deps.acquisition && answer.body.error === NOT_HELD) {
+        answer.body = {
+          ...answer.body,
+          error: 'Not held yet — TorBox is being asked for this album',
+          retryAfter: RETRY_AFTER_SECONDS,
+        };
+      }
       return send(reply, jsonBody(answer.body, answer.status));
     },
   );
+
+  // ── Media, when the proxy is on ─────────────────────────────────────────
+  if (deps.cfg.media.proxy) {
+    const serveMedia = async (
+      request: {
+        params: { file: string };
+        query: { exp?: string; sig?: string };
+        headers: Record<string, string | string[] | undefined>;
+        method: string;
+      },
+      reply: FastifyReply,
+    ) => {
+      const file = request.params.file;
+      const dot = file.lastIndexOf('.');
+      const id = decodeURIComponent(dot > 0 ? file.slice(0, dot) : file);
+      const ext = dot > 0 ? file.slice(dot + 1).toLowerCase() : 'flac';
+
+      const verdict = verifyMedia({
+        id,
+        exp: request.query.exp,
+        sig: request.query.sig,
+        secret: deps.cfg.media.secret,
+      });
+      if (!verdict.ok) {
+        return send(reply, jsonBody({ error: `Media link ${verdict.reason}` }, 403));
+      }
+      const track = deps.store.getTrack(id);
+      if (!track) return send(reply, jsonBody({ error: 'Not held by this addon' }, 404));
+      if (!deps.torbox) return send(reply, jsonBody({ error: 'TorBox key not configured' }, 503));
+
+      const range = request.headers.range;
+      let upstream: Response;
+      try {
+        const link = await linkFor(cache, track.id, () =>
+          deps.torbox!.requestLink(track.kind, track.itemId, track.fileId),
+        );
+        upstream = await fetchImpl(link, {
+          headers: {
+            ...(typeof range === 'string' ? { range } : {}),
+            // Harmless if the CDN ignores it, required if it does not.
+            authorization: `Bearer ${deps.cfg.torboxKey ?? ''}`,
+          },
+          redirect: 'follow',
+        });
+      } catch (error) {
+        deps.log.warn({ id, err: String(error).slice(0, 120) }, 'media fetch failed');
+        return send(reply, jsonBody({ error: 'Upstream fetch failed' }, 502));
+      }
+
+      const headers: Record<string, string> = {
+        'content-type': upstream.headers.get('content-type') ?? contentTypeFor(ext),
+        'accept-ranges': upstream.headers.get('accept-ranges') ?? 'bytes',
+        'cache-control': 'private, max-age=60',
+        ...CORS_HEADERS,
+      };
+      const length = upstream.headers.get('content-length');
+      const contentRange = upstream.headers.get('content-range');
+      if (length) headers['content-length'] = length;
+      if (contentRange) headers['content-range'] = contentRange;
+
+      reply.code(upstream.status).headers(headers);
+      if (request.method === 'HEAD' || !upstream.body) return reply.send();
+      // A player that seeks or cancels closes the socket mid-stream; Fastify treats
+      // that as a normal end, so nothing here needs to handle it.
+      return reply.send(Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0]));
+    };
+
+    app.get<{ Params: { file: string }; Querystring: { exp?: string; sig?: string } }>(
+      `${base}/media/:file`,
+      serveMedia as never,
+    );
+    // Fastify answers HEAD from the GET route automatically (exposeHeadRoutes), and
+    // `serveMedia` already short-circuits when the method is HEAD.
+  }
 
   // ── Health and the operator page ────────────────────────────────────────
   app.get(`${base}/health`, async (_request, reply) =>
