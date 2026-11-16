@@ -31,18 +31,50 @@ export class Sync {
     private readonly log: Logger,
   ) {}
 
-  /** One page per kind, so a huge account never blocks a request for long. */
+  /** One page per kind — kept for callers that want a bounded slice. */
   async walkAll(pageSize = 100): Promise<SyncResult[]> {
-    const results: SyncResult[] = [];
-    for (const kind of KINDS) {
-      try {
-        results.push(await this.walkPage(kind, pageSize));
-      } catch (error) {
-        this.log.warn({ kind, err: (error as Error).message }, 'sync page failed');
-        results.push({ kind, items: 0, tracks: 0, done: false });
+    return this.walkUntilDone({ pageSize, maxPages: KINDS.length });
+  }
+
+  /**
+   * Walk pages until every kind is finished, or the page budget runs out.
+   *
+   * Walking a single page per timer tick looked fine until the first real account:
+   * 200 items is two pages of 100, so a library of a few thousand would have taken
+   * one 6-hour interval per page. The budget is what keeps a huge account from
+   * holding the loop forever; the caller decides how often to come back.
+   */
+  async walkUntilDone(options: { maxPages?: number; pageSize?: number } = {}): Promise<SyncResult[]> {
+    const maxPages = Math.max(1, options.maxPages ?? 200);
+    const pageSize = options.pageSize ?? 100;
+    const totals = new Map<Kind, SyncResult>(
+      KINDS.map((kind) => [kind, { kind, items: 0, tracks: 0, done: false }]),
+    );
+    let pages = 0;
+    let pending: Kind[] = [...KINDS];
+
+    while (pending.length > 0 && pages < maxPages) {
+      const next: Kind[] = [];
+      for (const kind of pending) {
+        try {
+          const page = await this.walkPage(kind, pageSize);
+          const total = totals.get(kind);
+          if (total) {
+            total.items += page.items;
+            total.tracks += page.tracks;
+            total.done = page.done;
+          }
+          if (!page.done) next.push(kind);
+        } catch (error) {
+          this.log.warn({ kind, err: (error as Error).message }, 'sync page failed');
+          totals.set(kind, { kind, items: 0, tracks: 0, done: false });
+        }
+        pages += 1;
+        if (pages >= maxPages) break;
       }
+      pending = next;
     }
-    return results;
+    return [...totals.values()];
   }
 
   async walkPage(kind: Kind, pageSize = 100): Promise<SyncResult> {

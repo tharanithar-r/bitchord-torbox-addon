@@ -1,0 +1,44 @@
+# Overlay for a VPS where another reverse proxy already owns ports 80/443.
+#
+# Use this instead of docker-compose.yml:
+#
+#   docker compose -f docker-compose.proxy.yml up -d --build
+#
+# It runs only the addon — no Caddy, nothing published to the host — and attaches
+# it to the existing proxy's Docker network under a fixed container name, so the
+# proxy can `reverse_proxy bitchord-torbox-addon:8099`.
+#
+#   PROXY_NETWORK=web      # name of the network the existing proxy uses
+#
+# Find that network with:  docker inspect <proxy-container> -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}'
+
+services:
+  addon:
+    build: .
+    container_name: bitchord-torbox-addon
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "8099"
+      BIND_HOST: "0.0.0.0"
+      DB_PATH: "/data/index.db"
+    volumes:
+      - addon-data:/data
+    expose:
+      - "8099"
+    networks:
+      - proxy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8099/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  proxy:
+    external: true
+    name: ${PROXY_NETWORK:-web}
+
+volumes:
+  addon-data:

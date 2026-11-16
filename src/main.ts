@@ -60,13 +60,24 @@ async function main(): Promise<void> {
   let probing = false;
   let acquiring = false;
 
-  const runSync = async (): Promise<void> => {
-    if (!sync || syncing) return;
+  /**
+   * One walk pass, bounded by a page budget.
+   *
+   * Returns whether every kind finished, so the scheduler knows whether to come
+   * back in twenty seconds (a partial walk, e.g. a first run over a big library)
+   * or after the configured interval.
+   */
+  const runSync = async (): Promise<boolean> => {
+    if (!sync || syncing) return true;
     syncing = true;
     try {
-      await sync.walkAll();
+      const results = await sync.walkUntilDone({ maxPages: 50 });
+      const done = results.every((result) => result.done);
+      log.info({ results, done }, 'sync pass finished');
+      return done;
     } catch (error) {
       log.warn({ err: (error as Error).message }, 'sync loop failed');
+      return false;
     } finally {
       syncing = false;
     }
@@ -100,9 +111,19 @@ async function main(): Promise<void> {
   };
 
   const timers: NodeJS.Timeout[] = [];
+  let syncTimer: NodeJS.Timeout | null = null;
   if (sync) {
-    void runSync();
-    timers.push(setInterval(() => void runSync(), Math.max(1, cfg.syncIntervalMinutes) * 60_000));
+    // A first run is fired immediately; while it is still incomplete the next pass
+    // is 20 s away, and only a finished walk waits for the long interval.
+    const scheduleSync = (delayMs: number): void => {
+      syncTimer = setTimeout(() => {
+        void runSync().then((done) => {
+          scheduleSync(done ? Math.max(1, cfg.syncIntervalMinutes) * 60_000 : 20_000);
+        });
+      }, delayMs);
+      syncTimer.unref();
+    };
+    scheduleSync(0);
   }
   if (prober) timers.push(setInterval(() => void runProbe(), 3 * 60_000));
   if (acquisition) timers.push(setInterval(() => void runAcquire(), 60_000));
@@ -111,6 +132,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     log.info({ signal }, 'shutting down');
     for (const timer of timers) clearInterval(timer);
+    if (syncTimer) clearTimeout(syncTimer);
     await app.close().catch(() => undefined);
     store.close();
     process.exit(0);

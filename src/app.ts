@@ -170,7 +170,7 @@ export function createApp(deps: AppDeps): FastifyInstance {
 
   app.post(`${base}/admin/sync`, async (_request, reply) => {
     if (!deps.sync) return send(reply, jsonBody({ error: 'TorBox key not configured' }, 503));
-    const results = await deps.sync.walkAll();
+    const results = await deps.sync.walkUntilDone({ maxPages: 50 });
     return send(reply, jsonBody({ ok: true, results }));
   });
 
