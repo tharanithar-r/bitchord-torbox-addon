@@ -176,6 +176,46 @@ export function toAddonTrack(row: TrackRow, artworkUrl?: string): Record<string,
   return track;
 }
 
+/**
+ * The floor a row must clear to count as the recording that was asked for.
+ *
+ * This is the difference between "we hold something vaguely related" and "we hold
+ * this". It matters because of the loose OR fallback: a five-word query that misses
+ * in the index still returns dozens of rows that share one word, and handing those
+ * over means BitChord scores them all, finds nothing it trusts, and never asks us
+ * for the *right* song — while an empty answer would have let the addon go and
+ * fetch it.
+ */
+export const MATCH_FLOOR = 55;
+
+/** The best score among [rows] — what decides "do we actually hold this". */
+export function bestMatch(rows: TrackRow[], tokens: string[]): number {
+  return rows.reduce((top, row) => Math.max(top, Math.round(matchScore(row, tokens))), 0);
+}
+
+/**
+ * Collapse the same recording down to one row.
+ *
+ * A library holds an album and a single of the same song, a CD rip and a reissue;
+ * they share a title and an artist and differ only in where they came from. The
+ * working addons do this too — the hires addon keys on title|artist|duration — and
+ * it keeps the host scoring a handful of distinct candidates instead of re-scoring
+ * the same recording four times.
+ */
+export function dedupeRows(rows: TrackRow[], limit = 12): TrackRow[] {
+  const seen = new Set<string>();
+  const out: TrackRow[] = [];
+  for (const row of rows) {
+    const seconds = row.durationSec ? Math.round(row.durationSec) : '';
+    const key = `${foldText(row.title)}|${foldText(row.artist)}|${seconds}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 /** A hit-rate worry worth surfacing in logs: a query that tokenises to nothing. */
 export function hasUsableQuery(query: string | undefined): boolean {
   return tokenize(query ?? '').length > 0;

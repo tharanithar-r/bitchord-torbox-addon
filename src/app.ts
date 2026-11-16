@@ -10,7 +10,7 @@ import type { Logger } from 'pino';
 import type { Acquisition } from './acquire/queue.js';
 import type { AuthObservation, AuthObserver } from './auth/bitchord.js';
 import type { Config } from './config.js';
-import type { Store } from './db.js';
+import type { Store, TrackRow } from './db.js';
 import { CORS_HEADERS, htmlBody, jsonBody } from './http.js';
 import { artKeyFor } from './art.js';
 import { contentTypeFor, mediaUrl, verifyMedia } from './media.js';
@@ -19,7 +19,15 @@ import { normalizeQuery, tokenize } from './parse.js';
 import type { Prober } from './probe/worker.js';
 import { adminPage, healthBody } from './routes/admin.js';
 import { ADDON_VERSION, buildManifest } from './routes/manifest.js';
-import { hasUsableQuery, normalizeTier, rankRows, toAddonTrack } from './routes/search.js';
+import {
+  bestMatch,
+  dedupeRows,
+  hasUsableQuery,
+  MATCH_FLOOR,
+  normalizeTier,
+  rankRows,
+  toAddonTrack,
+} from './routes/search.js';
 import { linkFor, qualityLabel, resolveStream, type LinkCache } from './routes/stream.js';
 import type { Sync } from './sync.js';
 import type { TorBoxClient } from './torbox.js';
@@ -168,18 +176,26 @@ export function createApp(deps: AppDeps): FastifyInstance {
       const tier = normalizeTier(request.query.quality);
       const atmosWanted = /^(auto|1|true|on)$/i.test(request.query.atmos ?? '');
 
-      let rows = deps.store.searchTracks(tokens, 60);
+      // Ranked candidates are returned generously and judged by the app — that is
+      // what every working addon does (the TorBox one returns its top 10 by rank,
+      // the hires one dedupes and caps at 40). What must *not* be generous is the
+      // decision to go and fetch: that turns on whether anything clears the match
+      // floor, not on whether the response happens to be empty.
+      const rank = (candidates: TrackRow[]): TrackRow[] =>
+        dedupeRows(rankRows(candidates, tier, atmosWanted, tokens));
+
+      let rows = rank(deps.store.searchTracks(tokens, 60));
       let acquired = 0;
 
       // The one path that makes Home-screen playback work: a row has to exist
-      // before BitChord will ask for a stream, so an empty search tries to
-      // acquire the album itself (cached-only, deadline-bounded).
-      if (rows.length === 0 && deps.acquisition) {
+      // before BitChord will ask for a stream, so a search that holds nothing
+      // resembling the recording acquires the album itself (cached-only, bounded).
+      if (bestMatch(rows, tokens) < MATCH_FLOOR && deps.acquisition) {
         acquired = await deps.acquisition.acquireInline(query);
-        if (acquired > 0) rows = deps.store.searchTracks(tokens, 60);
+        if (acquired > 0) rows = rank(deps.store.searchTracks(tokens, 60));
       }
 
-      const ranked = rankRows(rows, tier, atmosWanted, tokens).slice(0, 30);
+      const ranked = rows.slice(0, 12);
       const artKeys = deps.store.artExists(ranked.map((row) => artKeyFor(row.artist, row.album)));
       const host = deps.cfg.publicHosts[0] ?? 'localhost';
       const tracks = ranked.map((row) =>
@@ -191,15 +207,19 @@ export function createApp(deps: AppDeps): FastifyInstance {
         ),
       );
       // The query is the one thing a Home-screen diagnosis needs: without it the
-      // log says a search happened but not what was asked for.
+      // log says a search happened but not what was asked for. `best` is what
+      // separates "we do not hold it" from "the app refused what we sent".
+      const best = bestMatch(ranked, tokens);
       deps.log.info(
         {
           q: query,
           tokens,
           tier,
           atmos: atmosWanted,
-          indexed: rows.length,
+          held: rows.length,
           offered: tracks.length,
+          best,
+          top: ranked.slice(0, 2).map((row) => `${row.artist} – ${row.title}`.slice(0, 60)),
           acquired,
         },
         'search',

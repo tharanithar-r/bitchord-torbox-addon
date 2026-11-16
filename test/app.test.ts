@@ -620,6 +620,96 @@ describe('album art', () => {
   });
 });
 
+describe('near-miss rows do not hide a miss', () => {
+  it('acquires when nothing clears the match floor, even though near-misses are returned', async () => {
+    const store = seededStore(); // holds only "Midnight Signal" by Example Artist
+    let acquired = 0;
+    const acquisition = {
+      acquireInline: async () => {
+        acquired += 1;
+        return 0; // nothing cached for this one
+      },
+      budgetLeft: () => 6,
+    } as unknown as Acquisition;
+    const app = createApp({
+      cfg: config(),
+      store,
+      log: createLogger('silent'),
+      auth: stubAuth(),
+      torbox: fakeTorbox(),
+      acquisition,
+    });
+    // One shared word ("midnight") would previously have returned the held track
+    // as if it were this recording.
+    const response = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/search?q=${encodeURIComponent('midnight city m83')}`,
+    });
+    // Candidates are still handed over — the host is the judge, as with every
+    // working addon — but the addon no longer mistakes them for a hit.
+    expect(acquired).toBe(1);
+    await app.close();
+    store.close();
+  });
+
+  it('collapses the same recording held twice and caps the answer', async () => {
+    const store = seededStore();
+    // Same title/artist/duration as the seeded row, from a different release.
+    store.upsertTrack({
+      id: trackId('torrents', 5, 1),
+      kind: 'torrents',
+      itemId: 5,
+      fileId: 1,
+      title: 'Midnight Signal',
+      artist: 'Example Artist',
+      album: 'Night Drive (Deluxe)',
+      discNo: null,
+      trackNo: 1,
+      seq: 0,
+      format: 'flac',
+      codec: 'flac',
+      container: 'flac',
+      sampleRate: 44_100,
+      bitDepth: 16,
+      durationSec: 242,
+      isrc: null,
+      sizeBytes: 1,
+      lossless: true,
+      atmos: false,
+      playable: true,
+    });
+    const app = appWith(store);
+    const response = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/search?q=${encodeURIComponent('midnight signal example artist')}`,
+    });
+    const tracks = (response.json() as { tracks: Array<Record<string, unknown>> }).tracks;
+    // One row per recording: the duplicate release is dropped, not offered twice.
+    // The Atmos mix is a different recording and stays; the duplicated stereo cut
+    // from the deluxe release must not appear twice.
+    expect(tracks.filter((t) => t.title === 'Midnight Signal')).toHaveLength(1);
+    expect(tracks.length).toBeLessThanOrEqual(12);
+    await app.close();
+    store.close();
+  });
+
+  it('still offers a recording whose title carries the query', async () => {
+    const store = seededStore();
+    const app = appWith(store);
+    const response = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/search?q=${encodeURIComponent('midnight signal example artist')}`,
+    });
+    const body = response.json() as { tracks: Array<Record<string, unknown>> };
+    // The fixture also holds the Atmos mix of the same recording, which is a
+    // legitimate second row; the stereo cut must come first.
+    expect(body.tracks.length).toBeGreaterThan(0);
+    expect(body.tracks[0]?.title).toBe('Midnight Signal');
+    await app.close();
+    store.close();
+  });
+});
+
 describe('inline acquisition from a search', () => {
   it('answers with rows when the album could be acquired right then', async () => {
     const store = seededStore();
