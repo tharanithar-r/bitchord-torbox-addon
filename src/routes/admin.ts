@@ -1,6 +1,7 @@
 import type { AuthCounters } from '../auth/bitchord.js';
 import type { Stats } from '../db.js';
 import { escapeHtml } from '../http.js';
+import { formatDuration } from '../parse.js';
 
 /**
  * The health answer BitChord probes, plus the operator page.
@@ -38,6 +39,14 @@ export function adminPage(input: {
   budgetLeft: number;
   acquireEnabled: boolean;
   allowUncached: boolean;
+  tracks: Array<{
+    id: string;
+    title: string;
+    artist: string;
+    album: string;
+    quality: string;
+    durationSec: number | null;
+  }>;
 }): string {
   const { stats, auth } = input;
   const codes = Object.entries(auth.byCode)
@@ -53,6 +62,19 @@ export function adminPage(input: {
         <td>${escapeHtml(row.seeders ?? '—')}</td>
         <td>${escapeHtml(row.source ?? '—')}</td>
         <td>${escapeHtml((row.note ?? '').slice(0, 80))}</td>
+      </tr>`,
+    )
+    .join('');
+
+  const tracks = input.tracks
+    .map(
+      (track) => `<tr>
+        <td><code>${escapeHtml(track.id)}</code></td>
+        <td>${escapeHtml(track.artist || '—')}</td>
+        <td>${escapeHtml(track.title)}</td>
+        <td>${escapeHtml(track.album || '—')}</td>
+        <td>${escapeHtml(track.quality)}</td>
+        <td>${track.durationSec ? escapeHtml(formatDuration(track.durationSec)) : '—'}</td>
       </tr>`,
     )
     .join('');
@@ -103,6 +125,13 @@ export function adminPage(input: {
   <ul>${codes || '<li>no requests yet</li>'}</ul>
   <p class="sub">Log-only by design: BitChord Web, Windows, macOS and Linux cannot produce the
   hardware proof, and refusing them would cut off platforms this addon is meant to serve.</p>
+</section>
+
+<section><h2>Sample of the index (first ${input.tracks.length})</h2>
+  <p class="sub">Copy an <code>id</code> into a stream call:
+  <code>curl "$H/$S/stream/&lt;id URL-encoded&gt;?quality=max"</code>. Full JSON: <code>/admin/tracks?limit=200</code></p>
+  <table><thead><tr><th>id</th><th>artist</th><th>title</th><th>album</th><th>quality</th><th>length</th></tr></thead>
+  <tbody>${tracks || '<tr><td colspan="6">nothing indexed yet — run a sync</td></tr>'}</tbody></table>
 </section>
 
 <section><h2>Acquisition</h2>

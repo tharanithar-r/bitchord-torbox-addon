@@ -373,6 +373,14 @@ export class Store {
     return raw ? trackFromRaw(raw) : null;
   }
 
+  /** First rows of the index, for the operator page and the debug route. */
+  sampleTracks(limit = 30): TrackRow[] {
+    const rows = this.db
+      .prepare('SELECT * FROM tracks ORDER BY rowid LIMIT ?')
+      .all(Math.max(1, Math.min(500, limit))) as Raw[];
+    return rows.map(trackFromRaw);
+  }
+
   tracksNeedingProbe(limit: number): TrackRow[] {
     const rows = this.db
       .prepare(

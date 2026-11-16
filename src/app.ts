@@ -17,7 +17,7 @@ import type { Prober } from './probe/worker.js';
 import { adminPage, healthBody } from './routes/admin.js';
 import { ADDON_VERSION, buildManifest } from './routes/manifest.js';
 import { hasUsableQuery, normalizeTier, rankRows, toAddonTrack } from './routes/search.js';
-import { resolveStream, type LinkCache } from './routes/stream.js';
+import { qualityLabel, resolveStream, type LinkCache } from './routes/stream.js';
 import type { Sync } from './sync.js';
 import type { TorBoxClient } from './torbox.js';
 
@@ -160,6 +160,14 @@ export function createApp(deps: AppDeps): FastifyInstance {
           host: deps.cfg.publicHosts[0] ?? 'localhost',
           basePath: deps.cfg.pathSecret,
           queue: deps.store.recentQueue(20),
+          tracks: deps.store.sampleTracks(30).map((track) => ({
+            id: track.id,
+            title: track.title,
+            artist: track.artist,
+            album: track.album,
+            quality: qualityLabel(track),
+            durationSec: track.durationSec,
+          })),
           budgetLeft: deps.acquisition?.budgetLeft() ?? 0,
           acquireEnabled: deps.cfg.acquire.enabled,
           allowUncached: deps.cfg.acquire.allowUncached,
@@ -167,6 +175,25 @@ export function createApp(deps: AppDeps): FastifyInstance {
       ),
     ),
   );
+
+  app.get<{ Querystring: { limit?: string } }>(`${base}/admin/tracks`, async (request, reply) => {
+    const limit = Number(request.query.limit ?? 50);
+    const tracks = deps.store
+      .sampleTracks(Number.isFinite(limit) ? limit : 50)
+      .map((track) => ({
+        id: track.id,
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        quality: qualityLabel(track),
+        codec: track.codec,
+        sampleRate: track.sampleRate,
+        bitDepth: track.bitDepth,
+        durationSec: track.durationSec,
+        probed: track.probedAt !== null,
+      }));
+    return send(reply, jsonBody({ count: tracks.length, tracks }));
+  });
 
   app.post(`${base}/admin/sync`, async (_request, reply) => {
     if (!deps.sync) return send(reply, jsonBody({ error: 'TorBox key not configured' }, 503));

@@ -59,6 +59,19 @@ function seededStore(): Store {
     atmos: false,
     playable: true,
   });
+  // A probed row, as the real prober would leave it.
+  store.recordProbe(trackId('torrents', 1, 2), {
+    codec: 'flac',
+    container: 'flac',
+    sampleRate: 96_000,
+    bitDepth: 24,
+    durationSec: 242,
+    isrc: 'USRC12345678',
+    lossless: true,
+    atmos: false,
+    playable: true,
+    note: null,
+  });
   store.upsertTrack({
     id: trackId('torrents', 1, 3),
     kind: 'torrents',
@@ -237,6 +250,33 @@ describe('stream', () => {
       url: `/${SECRET}/stream/${encodeURIComponent(trackId('torrents', 1, 2))}`,
     });
     expect(response.statusCode).toBe(503);
+    await app.close();
+    store.close();
+  });
+});
+
+describe('operator listing', () => {
+  it('lists indexed rows with ids that can be streamed', async () => {
+    const store = seededStore();
+    const app = appWith(store);
+    const response = await app.inject({ method: 'GET', url: `/${SECRET}/admin/tracks?limit=10` });
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { count: number; tracks: Array<Record<string, unknown>> };
+    expect(body.count).toBe(2);
+    expect(body.tracks[0]?.id).toBe(trackId('torrents', 1, 2));
+    expect(body.tracks[0]?.codec).toBe('flac');
+    expect(body.tracks[0]?.probed).toBe(true);
+    await app.close();
+    store.close();
+  });
+
+  it('renders the sample table on the operator page', async () => {
+    const store = seededStore();
+    const app = appWith(store);
+    const response = await app.inject({ method: 'GET', url: `/${SECRET}/admin` });
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('Sample of the index');
+    expect(response.body).toContain(trackId('torrents', 1, 2));
     await app.close();
     store.close();
   });
