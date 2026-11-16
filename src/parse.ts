@@ -95,6 +95,24 @@ export function foldText(value: string): string {
 }
 
 /**
+ * A query as BitChord sends it, reduced to the words an index actually stores.
+ *
+ * When the app resolves a YouTube-queued track through an addon, the query is
+ * derived from a *YouTube* title — `Paniyon Sa (From "Satyamev Jayate")`,
+ * `Song [feat. X]`, `Track (Official Video)`. None of that packaging is in a FLAC
+ * library, so searching for it as-is asks the index to match words it has never
+ * seen. The same stripping is applied to stored titles at index time, so both
+ * sides of the comparison are normalised.
+ */
+export function normalizeQuery(query: string): string {
+  return searchableTitle(query)
+    .replace(/\[(?:official|lyrics?|audio|video|visuali[sz]er|hd|hq|mv)[^\]]*\]/gi, ' ')
+    .replace(/\((?:official|lyrics?|audio|video|visuali[sz]er|hd|hq|mv)[^)]*\)/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/**
  * Search tokens, in the shape the FTS index can use.
  *
  * BitChord sends a whole `title artist` string (and then a bare title as a second

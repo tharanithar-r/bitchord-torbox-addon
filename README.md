@@ -138,16 +138,56 @@ shows up as `invalid_proof` and is fixed by editing `.env`.
   the measured sample rate, bit depth, duration, ISRC and embedded tags, and only then
   does a row claim `HI_RES_LOSSLESS`, `LOSSLESS` or Dolby.
 
+## Album art and lyrics
+
+**Posters.** A BitChord search row carries `artworkURL`, and without one an addon
+row has no image at all — a YouTube row brings its own thumbnail, an addon row
+only shows what the addon sends. TorBox holds files, not artwork, so the honest
+source is the cover embedded in the audio: the prober's single ranged read also
+yields the FLAC `PICTURE` block or the MP4 `covr` atom, which is stored once per
+album and served at `/<PATH_SECRET>/art/<album-key>` with an immutable one-year
+cache. Rows then carry `artworkURL` and `albumArtworkURL`. A cover larger than
+`PROBE_MAX_BYTES` is skipped rather than fetched separately.
+
+Rips without an embedded picture are the gap that the Tidal/Qobuz addons never
+have — their catalogue always carries a cover. So when a file has none, the prober
+asks iTunes' public search API (free, no key) once per album, takes the result only
+if the artist matches and the album name shares a word, downloads the 600×600 into
+the same `art` table, and serves it from the same route. `ART_FINDER=0` turns that
+off.
+
+**Lyrics are the app's business, not ours.** The addon protocol has no lyrics
+field — BitChord resolves lyrics itself from its own providers (lrc.red,
+BiniLyrics, BetterLyrics, LRCLIB, KuGou, Genius…), keyed on the recording. What we
+can do is give it the metadata those providers match on: `title`, `artist`,
+`album` and `duration`, which the prober fills from the embedded tags. Two limits
+worth knowing: the timing providers that match on an ISRC/recording id cannot be
+reached for an addon row because those ids have no field in the protocol, and a
+row that has never been probed has no duration and no tag-derived artist, which is
+the usual reason a track shows no lyrics. Finish probing and the name-based
+providers start working.
+
 ## Acquisition (optional)
 
 Free discovery, no new subscriptions: **Knaben** (`Audio / Lossless`) → **apibay**
 (category 104) → **torrents-csv**.
 
 ```
-miss on /stream → queue top 3 releases → checkcached(list_files)
-      cached    → createtorrent(add_only_if_cached) → mylist?id → index → playable in seconds
-      uncached  → skipped unless ACQUIRE_UNCACHED=1 (TorBox caps those at 60/hour)
+tap a song in BitChord
+  └─ /search            → rows from the index
+        └─ empty?       → acquireInline (cached-only, ≤4 s, one attempt per query per 10 min)
+                            cached    → createtorrent(add_only_if_cached) → mylist?id → index → rows in the same answer
+                            uncached  → queued, and the worker adds it if ACQUIRE_UNCACHED=1
+  └─ /stream (miss)     → queue + `retryAfter` hint
 ```
+
+The inline step exists because BitChord only calls `/stream` for a row it was
+shown: an addon that answers an empty search has no second chance at that track.
+One caveat that is the app's, not ours: BitChord caches a search answer for ten
+minutes, so an album that finishes downloading is picked up by the app within that
+window rather than instantly. The `retryAfter` field on a miss is the forward
+compatible half of BitChord's own "ask the addon again" design (issue #1523),
+which swaps a track to FLAC mid-song once released.
 
 Guardrails: one release per infohash, `MAX_ALBUMS_PER_HOUR`, `MIN_SEEDERS`,
 `MAX_ALBUM_GB`, and `ACQUIRE_ENABLED=0` as a kill switch. BitChord has no notice

@@ -2,7 +2,9 @@ import type { Logger } from 'pino';
 import type { Store, TrackRow } from '../db.js';
 import { LOSSLESS_FORMATS } from '../parse.js';
 import type { TorBoxClient } from '../torbox.js';
-import { ALBUM_KEYS, ARTIST_KEYS, TITLE_KEYS, pickTag, probeUrl } from './audio.js';
+import { artKeyFor, extractCover } from '../art.js';
+import { downloadCover, findCoverSource } from '../artfinder.js';
+import { ALBUM_KEYS, ARTIST_KEYS, TITLE_KEYS, fetchHead, parseAudioHead, pickTag } from './audio.js';
 
 /**
  * Filling the index in with what the files actually are.
@@ -22,7 +24,11 @@ export class Prober {
     private readonly store: Store,
     private readonly torbox: TorBoxClient,
     private readonly log: Logger,
-    private readonly options: { maxBytes: number } = { maxBytes: 512 * 1024 },
+    private readonly options: {
+      maxBytes: number;
+      artFinder?: boolean;
+      fetchImpl?: typeof fetch;
+    } = { maxBytes: 512 * 1024 },
   ) {}
 
   async runBatch(limit: number): Promise<{ probed: number; failed: number }> {
@@ -40,8 +46,11 @@ export class Prober {
   async probe(track: TrackRow): Promise<boolean> {
     try {
       const url = await this.torbox.requestLink(track.kind, track.itemId, track.fileId);
-      const head = await probeUrl(url, { maxBytes: this.options.maxBytes });
-      if (!head) {
+      // One ranged read answers both questions: what the audio is, and what its
+      // cover looks like. Art is what a search row needs to show a poster at all.
+      const head = await fetchHead(url, { maxBytes: this.options.maxBytes });
+      const probe = head ? parseAudioHead(head) : null;
+      if (!head || !probe) {
         this.store.recordProbe(track.id, {
           codec: null,
           container: null,
@@ -56,27 +65,50 @@ export class Prober {
         });
         return false;
       }
-      const codec = head.codec;
+      const codec = probe.codec;
       const lossless = LOSSLESS_FORMATS.has(codec);
       const atmos = codec === 'eac3-joc';
-      const title = pickTag(head.tags, TITLE_KEYS);
-      const artist = pickTag(head.tags, ARTIST_KEYS);
-      const album = pickTag(head.tags, ALBUM_KEYS);
+      const title = pickTag(probe.tags, TITLE_KEYS);
+      const artist = pickTag(probe.tags, ARTIST_KEYS);
+      const album = pickTag(probe.tags, ALBUM_KEYS);
       this.store.recordProbe(track.id, {
         codec,
-        container: head.container,
-        sampleRate: head.sampleRate ?? null,
-        bitDepth: head.bitDepth ?? null,
-        durationSec: head.durationSec ?? null,
-        isrc: head.isrc ?? null,
+        container: probe.container,
+        sampleRate: probe.sampleRate ?? null,
+        bitDepth: probe.bitDepth ?? null,
+        durationSec: probe.durationSec ?? null,
+        isrc: probe.isrc ?? null,
         lossless,
         atmos,
-        playable: head.playable,
-        note: head.playable ? null : `unsupported codec ${codec}`,
+        playable: probe.playable,
+        note: probe.playable ? null : `unsupported codec ${codec}`,
         title: title ? stripTrackPrefix(title) : undefined,
         artist,
         album,
       });
+
+      // Store the cover once per album. Keys are computed from the same
+      // artist/album the search rows report, so every track in the album points
+      // at the one image.
+      const effectiveArtist = artist ?? track.artist;
+      const effectiveAlbum = album ?? track.album;
+      const artKey = artKeyFor(effectiveArtist, effectiveAlbum);
+      if (effectiveAlbum.trim() !== '' && this.store.art(artKey) === null) {
+        const cover = extractCover(head);
+        if (cover) {
+          this.store.putArt(artKey, cover.mime, cover.bytes);
+        } else if (this.options.artFinder !== false) {
+          // A rip with no embedded picture still needs a poster; the catalogue is
+          // asked once per album, and a miss is not retried.
+          const source = await findCoverSource(effectiveArtist, effectiveAlbum, {
+            fetchImpl: this.options.fetchImpl,
+          });
+          const bytes = source
+            ? await downloadCover(source, { fetchImpl: this.options.fetchImpl })
+            : null;
+          if (source && bytes) this.store.putArt(artKey, source.mime, bytes);
+        }
+      }
       return true;
     } catch (error) {
       this.store.recordProbe(track.id, {

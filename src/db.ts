@@ -185,6 +185,13 @@ CREATE TABLE IF NOT EXISTS queue (
 
 CREATE INDEX IF NOT EXISTS queue_state ON queue (state, created_at);
 
+CREATE TABLE IF NOT EXISTS art (
+  art_key    TEXT PRIMARY KEY,
+  mime       TEXT    NOT NULL,
+  bytes      BLOB    NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_state (
   kind      TEXT PRIMARY KEY,
   cursor    INTEGER NOT NULL DEFAULT 0,
@@ -449,6 +456,36 @@ export class Store {
       atmos: count('SELECT COUNT(*) AS n FROM tracks WHERE atmos = 1'),
       queue,
     };
+  }
+
+  // ── Album art ────────────────────────────────────────────────────────────
+
+  /** Store a cover once per album; later tracks of the same album reuse it. */
+  putArt(key: string, mime: string, bytes: Uint8Array): void {
+    this.db
+      .prepare(
+        `INSERT INTO art (art_key, mime, bytes, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT (art_key) DO NOTHING`,
+      )
+      .run(key, mime, bytes, Math.floor(Date.now() / 1000));
+  }
+
+  art(key: string): { mime: string; bytes: Uint8Array } | null {
+    const raw = this.db.prepare('SELECT mime, bytes FROM art WHERE art_key = ?').get(key) as
+      | { mime: string; bytes: Uint8Array }
+      | undefined;
+    return raw ? { mime: raw.mime, bytes: raw.bytes } : null;
+  }
+
+  /** Which of these album keys already have a cover — one query per search. */
+  artExists(keys: string[]): Set<string> {
+    const unique = [...new Set(keys.filter((k) => k !== ''))];
+    if (unique.length === 0) return new Set();
+    const placeholders = unique.map(() => '?').join(', ');
+    const rows = this.db
+      .prepare(`SELECT art_key FROM art WHERE art_key IN (${placeholders})`)
+      .all(...unique) as Raw[];
+    return new Set(rows.map((row) => String(row.art_key)));
   }
 
   // ── Sync cursors ──────────────────────────────────────────────────────────

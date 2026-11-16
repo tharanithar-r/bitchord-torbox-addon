@@ -2,7 +2,7 @@ import type { Logger } from 'pino';
 import type { Store, TrackRow } from '../db.js';
 import type { Sync } from '../sync.js';
 import type { TorBoxClient } from '../torbox.js';
-import { magnetFor, searchIndexers, type Release } from './indexers.js';
+import { magnetFor, searchIndexers, type IndexerOptions, type Release } from './indexers.js';
 
 /**
  * Turning "I do not have this" into "I will have this shortly".
@@ -34,9 +34,17 @@ export type AcquireConfig = {
 
 export type ProcessOutcome = 'added' | 'cached-added' | 'skipped' | 'failed' | 'empty' | 'budget';
 
+export type AcquireDeps = {
+  /** Injected in tests; production uses the free indexers. */
+  search?: (query: string, options?: IndexerOptions) => Promise<Release[]>;
+};
+
 export class Acquisition {
   /** Timestamps of every add this process has made, for the hourly ceiling. */
   private adds: number[] = [];
+  /** Queries already tried inline, so a 3-query search does not become 3 indexer runs. */
+  private readonly recent = new Map<string, number>();
+  private readonly search: (query: string, options?: IndexerOptions) => Promise<Release[]>;
 
   constructor(
     private readonly store: Store,
@@ -44,7 +52,86 @@ export class Acquisition {
     private readonly sync: Sync,
     private readonly log: Logger,
     private readonly cfg: AcquireConfig,
-  ) {}
+    deps: AcquireDeps = {},
+  ) {
+    this.search = deps.search ?? searchIndexers;
+  }
+
+  /**
+   * A bounded, cached-only attempt made from `/search` itself.
+   *
+   * This is what makes a song from BitChord's Home screen work: the app only
+   * calls `/stream` for a row it was shown, so an addon that answers an empty
+   * search has no way to be asked again. Acquiring here means the album is
+   * fetched *and indexed* before the search answers, so the row exists.
+   *
+   * Cached-only and deadline-bounded on purpose: a cached release adds in a
+   * second or two, an uncached one is a queue item and not something a search
+   * may wait on. Every release that is not cached is queued for the worker.
+   */
+  async acquireInline(query: string, budgetMs = 4000): Promise<number> {
+    if (!this.cfg.enabled) return 0;
+    const key = query.trim().toLowerCase();
+    if (key.length < 3) return 0;
+    const now = Date.now();
+    const last = this.recent.get(key) ?? 0;
+    // BitChord asks up to three queries per search; without this, one tap would
+    // become three indexer runs and three batches of cache checks.
+    if (now - last < 10 * 60_000) return 0;
+    if (this.budgetLeft() <= 0) return 0;
+    this.recent.set(key, now);
+
+    const deadline = now + budgetMs;
+    try {
+      const releases = await this.search(query, {
+        minSeeders: this.cfg.minSeeders,
+        maxSizeBytes: this.cfg.maxAlbumGb * 1024 ** 3,
+        limit: 10,
+        log: this.log,
+      });
+      const candidates = releases.slice(0, 3);
+      if (candidates.length === 0) return 0;
+
+      const cached = await this.torbox.checkCached(
+        candidates.map((release) => release.hash),
+        { kind: 'torrents' },
+      );
+
+      for (const release of candidates) {
+        // Whatever cannot be served now is queued, so it can appear later.
+        if (!cached[release.hash]) {
+          this.store.enqueue({
+            hash: release.hash,
+            name: release.name,
+            sizeBytes: release.sizeBytes,
+            seeders: release.seeders,
+            source: release.source,
+          });
+          continue;
+        }
+        if (Date.now() > deadline) continue;
+        const added = await this.torbox.addTorrent(release.magnet, {
+          onlyIfCached: true,
+          name: release.name,
+        });
+        this.countAdd();
+        const indexed = await this.sync.syncItem('torrents', added.torrentId).catch(() => 0);
+        this.store.updateQueue(release.hash, {
+          state: 'added',
+          itemKind: 'torrents',
+          itemId: added.torrentId,
+          note: `inline, ${indexed} tracks indexed`,
+        });
+        if (indexed > 0) {
+          this.log.info({ query, indexed }, 'acquired inline for a search');
+          return indexed;
+        }
+      }
+    } catch (error) {
+      this.log.warn({ query, err: (error as Error).message.slice(0, 120) }, 'inline acquire failed');
+    }
+    return 0;
+  }
 
   /** Queue plausible releases for a track that was asked for and is not held. */
   async queueForTrack(track: TrackRow): Promise<number> {

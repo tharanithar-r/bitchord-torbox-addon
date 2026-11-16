@@ -1,5 +1,5 @@
 import type { TrackRow } from '../db.js';
-import { tokenize } from '../parse.js';
+import { foldText, tokenize } from '../parse.js';
 
 /**
  * Quality negotiation, in BitChord's vocabulary.
@@ -55,6 +55,49 @@ export function rowScore(row: TrackRow, tier: Tier, atmosWanted: boolean): numbe
 }
 
 /**
+ * How well a row is the recording that was asked for.
+ *
+ * This matters more than it looks. When BitChord resolves a YouTube-queued track
+ * through this addon it keeps YouTube's metadata and takes only our audio, so the
+ * row is never shown — it is only *judged*. A library holding the album and the
+ * single, or a live version beside the studio one, must hand back the studio cut,
+ * and a quality-first ordering would hand back whichever file happened to be
+ * hi-res. Title overlap counts double: it is what separates
+ * `So What` from `So What (Live at Newport)`.
+ */
+/** Words that mark a different cut of a recording, not a better copy of it. */
+const VERSION_WORDS = new Set([
+  'live',
+  'remix',
+  'instrumental',
+  'karaoke',
+  'demo',
+  'edit',
+  'acoustic',
+  'remaster',
+  'remastered',
+  'sped',
+  'slowed',
+  'reprise',
+]);
+
+export function matchScore(row: TrackRow, tokens: string[]): number {
+  if (tokens.length === 0) return 0;
+  const title = foldText(row.title);
+  const hay = `${title} ${foldText(row.artist)} ${foldText(row.album)}`;
+  const anywhere = tokens.filter((token) => hay.includes(token)).length / tokens.length;
+  const inTitle = tokens.filter((token) => title.includes(token)).length / tokens.length;
+
+  // Sharing every word is not the same as being the same recording: `So What
+  // (Live at Newport)` matches a query for `So What` exactly as well as `So What`
+  // does. The words a title carries *beyond* the query are what tells them apart,
+  // and a version marker among them is decisive.
+  const extra = tokenize(row.title).filter((token) => !tokens.includes(token));
+  const penalty = extra.length * 10 + (extra.some((token) => VERSION_WORDS.has(token)) ? 25 : 0);
+  return Math.max(0, anywhere * 55 + inTitle * 45 - penalty);
+}
+
+/**
  * Order the candidates for a request.
  *
  * The three rules that come straight from the docs:
@@ -64,28 +107,55 @@ export function rowScore(row: TrackRow, tier: Tier, atmosWanted: boolean): numbe
  *    without it";
  *  - a tier is a preference, not a filter: something playable beats nothing.
  */
-export function rankRows(rows: TrackRow[], tier: Tier, atmosWanted: boolean): TrackRow[] {
+export function rankRows(
+  rows: TrackRow[],
+  tier: Tier,
+  atmosWanted: boolean,
+  tokens: string[] = [],
+): TrackRow[] {
   if (tier === 'none') return [];
   const playable = rows.filter((row) => row.playable);
   if (tier === 'atmos') {
     const immersive = playable.filter((row) => row.atmos);
-    if (immersive.length > 0) return immersive;
-    return playable.filter((row) => row.lossless);
+    if (immersive.length > 0) return byMatch(immersive, tokens);
+    return byMatch(
+      playable.filter((row) => row.lossless),
+      tokens,
+    );
   }
+  // Match first, quality second: the same recording at CD quality beats a hi-res
+  // file that only shares a word with what was asked for.
   return playable
-    .map((row) => ({ row, score: rowScore(row, tier, atmosWanted) }))
-    .sort((a, b) => b.score - a.score)
+    .map((row) => ({
+      row,
+      match: Math.round(matchScore(row, tokens)),
+      quality: rowScore(row, tier, atmosWanted),
+    }))
+    .sort((a, b) => b.match - a.match || b.quality - a.quality)
+    .map((entry) => entry.row);
+}
+
+function byMatch(rows: TrackRow[], tokens: string[]): TrackRow[] {
+  return rows
+    .map((row) => ({ row, match: Math.round(matchScore(row, tokens)) }))
+    .sort((a, b) => b.match - a.match)
     .map((entry) => entry.row);
 }
 
 /** One search row, in the shape the addon protocol defines. */
-export function toAddonTrack(row: TrackRow): Record<string, unknown> {
+export function toAddonTrack(row: TrackRow, artworkUrl?: string): Record<string, unknown> {
   const track: Record<string, unknown> = {
     id: row.id,
     title: row.title,
     artist: row.artist,
     album: row.album,
   };
+  // Without this the player has no poster for an addon row: a YouTube row brings
+  // its own thumbnail, an addon row only shows what the addon sends.
+  if (artworkUrl) {
+    track.artworkURL = artworkUrl;
+    track.albumArtworkURL = artworkUrl;
+  }
   if (row.durationSec && row.durationSec > 0) track.duration = Math.round(row.durationSec);
 
   if (row.atmos) {

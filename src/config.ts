@@ -32,6 +32,8 @@ export type Config = {
   probe: {
     batchSize: number;
     maxBytes: number;
+    /** Look up a cover from a free catalogue when the file carries none. */
+    artFinder: boolean;
   };
   /**
    * Serve audio through this server instead of handing over TorBox's presigned URL.
@@ -66,6 +68,7 @@ const Raw = z.object({
   MEDIA_PROXY: z.string().default('0'),
   MEDIA_SECRET: z.string().optional(),
   MEDIA_TTL_SECONDS: z.coerce.number().int().min(300).max(86_400).default(1800),
+  ART_FINDER: z.string().default('1'),
   PROBE_BATCH: z.coerce.number().int().min(0).default(40),
   PROBE_MAX_BYTES: z.coerce.number().int().min(8192).default(524288),
   SYNC_INTERVAL_MINUTES: z.coerce.number().int().min(0).default(360),
@@ -147,6 +150,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     probe: {
       batchSize: v.PROBE_BATCH,
       maxBytes: v.PROBE_MAX_BYTES,
+      artFinder: v.ART_FINDER === '1' || v.ART_FINDER.toLowerCase() === 'true',
     },
     media: {
       proxy: v.MEDIA_PROXY === '1' || v.MEDIA_PROXY.toLowerCase() === 'true',

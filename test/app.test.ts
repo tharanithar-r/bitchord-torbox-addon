@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Acquisition } from '../src/acquire/queue.js';
+import { artKeyFor } from '../src/art.js';
 import { createApp } from '../src/app.js';
 import type { AuthObserver } from '../src/auth/bitchord.js';
 import type { Config } from '../src/config.js';
@@ -21,7 +22,7 @@ function config(): Config {
     dbPath: ':memory:',
     logLevel: 'silent',
     acquire: { enabled: false, allowUncached: false, maxAlbumsPerHour: 0, minSeeders: 1, maxAlbumGb: 8 },
-    probe: { batchSize: 0, maxBytes: 524288 },
+    probe: { batchSize: 0, maxBytes: 524288, artFinder: false },
     media: { proxy: false, secret: 'test-media-secret-0123456789', ttlSeconds: 1800 },
     syncIntervalMinutes: 0,
   };
@@ -446,6 +447,179 @@ describe('signed media route (MEDIA_PROXY=1)', () => {
     });
     expect(expired.statusCode).toBe(403);
     expect(cdn.calls).toHaveLength(0);
+    await app.close();
+    store.close();
+  });
+});
+
+describe('matching the recording BitChord asked for', () => {
+  function twoVersions(): Store {
+    const store = seededStore();
+    // A hi-res live cut and a CD-quality studio cut, both plausibly matching the query.
+    store.upsertTrack({
+      id: trackId('torrents', 2, 1),
+      kind: 'torrents',
+      itemId: 2,
+      fileId: 1,
+      title: 'So What (Live at Newport)',
+      artist: 'Miles Davis',
+      album: 'At Newport 1958',
+      discNo: null,
+      trackNo: 1,
+      seq: 0,
+      format: 'flac',
+      codec: 'flac',
+      container: 'flac',
+      sampleRate: 192_000,
+      bitDepth: 24,
+      durationSec: 528,
+      isrc: null,
+      sizeBytes: 1,
+      lossless: true,
+      atmos: false,
+      playable: true,
+    });
+    store.upsertTrack({
+      id: trackId('torrents', 3, 1),
+      kind: 'torrents',
+      itemId: 3,
+      fileId: 1,
+      title: 'So What',
+      artist: 'Miles Davis',
+      album: 'Kind of Blue',
+      discNo: null,
+      trackNo: 1,
+      seq: 0,
+      format: 'flac',
+      codec: 'flac',
+      container: 'flac',
+      sampleRate: 44_100,
+      bitDepth: 16,
+      durationSec: 545,
+      isrc: null,
+      sizeBytes: 1,
+      lossless: true,
+      atmos: false,
+      playable: true,
+    });
+    return store;
+  }
+
+  it('prefers the studio cut over a hi-res live version', async () => {
+    const store = twoVersions();
+    const app = appWith(store);
+    const response = await app.inject({ method: 'GET', url: `/${SECRET}/search?q=so%20what%20miles%20davis` });
+    const tracks = (response.json() as { tracks: Array<Record<string, unknown>> }).tracks;
+    expect(tracks[0]?.title).toBe('So What');
+    await app.close();
+    store.close();
+  });
+
+  it('strips YouTube packaging before searching', async () => {
+    const store = seededStore();
+    const app = appWith(store);
+    // A query shaped like a YouTube title: our library has no such words stored.
+    const response = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/search?q=${encodeURIComponent('Midnight Signal (From "Night Drive") [Official Video]')}`,
+    });
+    const tracks = (response.json() as { tracks: Array<Record<string, unknown>> }).tracks;
+    expect(tracks[0]?.title).toBe('Midnight Signal');
+    await app.close();
+    store.close();
+  });
+});
+
+describe('album art', () => {
+  const COVER = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+
+  it('serves a stored cover with a long immutable cache', async () => {
+    const store = seededStore();
+    const key = artKeyFor('Example Artist', 'Night Drive');
+    store.putArt(key, 'image/jpeg', COVER);
+    const app = appWith(store);
+    const response = await app.inject({ method: 'GET', url: `/${SECRET}/art/${key}.jpg` });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toBe('image/jpeg');
+    expect(String(response.headers['cache-control'])).toContain('immutable');
+    expect(response.rawPayload.subarray(0, 2).toString('latin1')).toBe(String.fromCharCode(0xff, 0xd8));
+    await app.close();
+    store.close();
+  });
+
+  it('404s an unknown cover instead of inventing one', async () => {
+    const store = seededStore();
+    const app = appWith(store);
+    const response = await app.inject({ method: 'GET', url: `/${SECRET}/art/nope.jpg` });
+    expect(response.statusCode).toBe(404);
+    await app.close();
+    store.close();
+  });
+
+  it('puts artworkURL on search rows once the album has a cover', async () => {
+    const store = seededStore();
+    store.putArt(artKeyFor('Example Artist', 'Night Drive'), 'image/jpeg', COVER);
+    const app = appWith(store);
+    const response = await app.inject({ method: 'GET', url: `/${SECRET}/search?q=midnight%20signal` });
+    const body = response.json() as { tracks: Array<Record<string, unknown>> };
+    // Without this the player has no poster for an addon row.
+    expect(String(body.tracks[0]?.artworkURL)).toBe(
+      `https://addon.example.com/${SECRET}/art/${artKeyFor('Example Artist', 'Night Drive')}`,
+    );
+    expect(body.tracks[0]?.albumArtworkURL).toBe(body.tracks[0]?.artworkURL);
+    await app.close();
+    store.close();
+  });
+});
+
+describe('inline acquisition from a search', () => {
+  it('answers with rows when the album could be acquired right then', async () => {
+    const store = seededStore();
+    let calls = 0;
+    const acquisition = {
+      acquireInline: async () => {
+        calls += 1;
+        // What a real inline acquire does: the row now exists.
+        store.upsertTrack({
+          id: trackId('torrents', 9, 1),
+          kind: 'torrents',
+          itemId: 9,
+          fileId: 1,
+          title: 'So What',
+          artist: 'Miles Davis',
+          album: 'Kind of Blue',
+          discNo: null,
+          trackNo: 1,
+          seq: 0,
+          format: 'flac',
+          codec: 'flac',
+          container: 'flac',
+          sampleRate: 96_000,
+          bitDepth: 24,
+          durationSec: 545,
+          isrc: null,
+          sizeBytes: 1,
+          lossless: true,
+          atmos: false,
+          playable: true,
+        });
+        return 1;
+      },
+      budgetLeft: () => 6,
+    } as unknown as Acquisition;
+    const app = createApp({
+      cfg: config(),
+      store,
+      log: createLogger('silent'),
+      auth: stubAuth(),
+      torbox: fakeTorbox(),
+      acquisition,
+    });
+    const response = await app.inject({ method: 'GET', url: `/${SECRET}/search?q=so%20what%20miles%20davis` });
+    const body = response.json() as { tracks: Array<Record<string, unknown>> };
+    expect(calls).toBe(1);
+    expect(body.tracks[0]?.title).toBe('So What');
+    expect(body.tracks[0]?.audioQuality).toBe('HI_RES_LOSSLESS');
     await app.close();
     store.close();
   });

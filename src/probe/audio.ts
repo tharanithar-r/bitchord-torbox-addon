@@ -551,7 +551,13 @@ export function parseAudioHead(buf: Uint8Array): ProbeResult | null {
  * One ranged request, bounded by `maxBytes`, with the body read through a stream
  * so a server that ignores `Range` cannot pull an entire 500 MB album into memory.
  */
-export async function probeUrl(
+/**
+ * The smallest prefix of a file, fetched once.
+ *
+ * Split out of [probeUrl] so a caller that wants both the measurements and the
+ * embedded cover — the prober does — pays for one ranged request instead of two.
+ */
+export async function fetchHead(
   url: string,
   options: {
     fetchImpl?: typeof fetch;
@@ -559,7 +565,7 @@ export async function probeUrl(
     headers?: Record<string, string>;
     signal?: AbortSignal;
   } = {},
-): Promise<ProbeResult | null> {
+): Promise<Uint8Array | null> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const maxBytes = options.maxBytes ?? 512 * 1024;
   const controller = new AbortController();
@@ -572,13 +578,26 @@ export async function probeUrl(
       redirect: 'follow',
     });
     if (!response.ok && response.status !== 206) return null;
-    const buf = await readAtMost(response, maxBytes);
-    return parseAudioHead(buf);
+    return await readAtMost(response, maxBytes);
   } catch {
     return null;
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** What is on the end of [url], or null when the head could not be read. */
+export async function probeUrl(
+  url: string,
+  options: {
+    fetchImpl?: typeof fetch;
+    maxBytes?: number;
+    headers?: Record<string, string>;
+    signal?: AbortSignal;
+  } = {},
+): Promise<ProbeResult | null> {
+  const head = await fetchHead(url, options);
+  return head ? parseAudioHead(head) : null;
 }
 
 async function readAtMost(response: Response, maxBytes: number): Promise<Uint8Array> {

@@ -12,9 +12,10 @@ import type { AuthObserver } from './auth/bitchord.js';
 import type { Config } from './config.js';
 import type { Store } from './db.js';
 import { CORS_HEADERS, htmlBody, jsonBody } from './http.js';
+import { artKeyFor } from './art.js';
 import { contentTypeFor, mediaUrl, verifyMedia } from './media.js';
 import { redactUrl } from './log.js';
-import { tokenize } from './parse.js';
+import { normalizeQuery, tokenize } from './parse.js';
 import type { Prober } from './probe/worker.js';
 import { adminPage, healthBody } from './routes/admin.js';
 import { ADDON_VERSION, buildManifest } from './routes/manifest.js';
@@ -132,17 +133,38 @@ export function createApp(deps: AppDeps): FastifyInstance {
       const query = request.query.q ?? '';
       if (!hasUsableQuery(query)) return send(reply, jsonBody({ tracks: [] }));
 
-      const tokens = tokenize(query);
+      // YouTube-sourced queries carry packaging (`(From "Film")`, `[Official Video]`)
+      // that no library stores; strip it before it reaches the index.
+      const tokens = tokenize(normalizeQuery(query));
       const tier = normalizeTier(request.query.quality);
       const atmosWanted = /^(auto|1|true|on)$/i.test(request.query.atmos ?? '');
 
-      const rows = deps.store.searchTracks(tokens, 60);
-      const ranked = rankRows(rows, tier, atmosWanted).slice(0, 30);
+      let rows = deps.store.searchTracks(tokens, 60);
+
+      // The one path that makes Home-screen playback work: a row has to exist
+      // before BitChord will ask for a stream, so an empty search tries to
+      // acquire the album itself (cached-only, deadline-bounded).
+      if (rows.length === 0 && deps.acquisition) {
+        const indexed = await deps.acquisition.acquireInline(query);
+        if (indexed > 0) rows = deps.store.searchTracks(tokens, 60);
+      }
+
+      const ranked = rankRows(rows, tier, atmosWanted, tokens).slice(0, 30);
+      const artKeys = deps.store.artExists(ranked.map((row) => artKeyFor(row.artist, row.album)));
+      const host = deps.cfg.publicHosts[0] ?? 'localhost';
+      const tracks = ranked.map((row) =>
+        toAddonTrack(
+          row,
+          artKeys.has(artKeyFor(row.artist, row.album))
+            ? `https://${host}${base}/art/${artKeyFor(row.artist, row.album)}`
+            : undefined,
+        ),
+      );
       deps.log.debug(
-        { query, tokens, tier, atmosWanted, candidates: rows.length, offered: ranked.length },
+        { query, tokens, tier, atmosWanted, candidates: rows.length, offered: tracks.length },
         'search',
       );
-      return send(reply, jsonBody({ tracks: ranked.map(toAddonTrack) }));
+      return send(reply, jsonBody({ tracks }));
     },
   );
 
@@ -198,6 +220,23 @@ export function createApp(deps: AppDeps): FastifyInstance {
       return send(reply, jsonBody(answer.body, answer.status));
     },
   );
+
+  // ── Album art ───────────────────────────────────────────────────────────
+  app.get<{ Params: { key: string } }>(`${base}/art/:key`, async (request, reply) => {
+    const key = request.params.key.replace(/\.[a-z0-9]+$/i, '');
+    const art = deps.store.art(key);
+    if (!art) return reply.code(404).send();
+    // Immutable and long-lived: an album's cover does not change, and the app's
+    // image loader should never ask twice.
+    return reply
+      .code(200)
+      .headers({
+        'content-type': art.mime,
+        'cache-control': 'public, max-age=31536000, immutable',
+        ...CORS_HEADERS,
+      })
+      .send(Buffer.from(art.bytes));
+  });
 
   // ── Media, when the proxy is on ─────────────────────────────────────────
   if (deps.cfg.media.proxy) {

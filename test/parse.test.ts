@@ -7,6 +7,7 @@ import {
   isAtmosName,
   isHiResName,
   isIndexableAudio,
+  normalizeQuery,
   parseFileName,
   parseReleaseName,
   searchableTitle,
@@ -85,6 +86,13 @@ describe('search text', () => {
     expect(ftsQuery(['radiohead', 'rainbows'])).toBe('"radiohead"* AND "rainbows"*');
     expect(ftsQueryLoose(['radiohead', 'rainbows'])).toBe('"radiohead"* OR "rainbows"*');
     expect(ftsQuery([])).toBeNull();
+  });
+
+  it('normalises a YouTube-shaped query to the words an index stores', () => {
+    expect(normalizeQuery('Paniyon Sa (From "Satyamev Jayate")')).toBe('Paniyon Sa');
+    expect(normalizeQuery('Song [Official Video]')).toBe('Song');
+    expect(normalizeQuery('Track (Lyric Video)')).toBe('Track');
+    expect(normalizeQuery('So What')).toBe('So What');
   });
 
   it('removes the packaging BitChord is given by YouTube titles', () => {

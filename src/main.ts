@@ -25,7 +25,9 @@ async function main(): Promise<void> {
 
   const torbox = cfg.torboxKey ? new TorBoxClient(cfg.torboxKey) : undefined;
   const sync = torbox ? new Sync(store, torbox, log) : undefined;
-  const prober = torbox ? new Prober(store, torbox, log, { maxBytes: cfg.probe.maxBytes }) : undefined;
+  const prober = torbox
+    ? new Prober(store, torbox, log, { maxBytes: cfg.probe.maxBytes, artFinder: cfg.probe.artFinder })
+    : undefined;
   const acquisition =
     torbox && sync
       ? new Acquisition(store, torbox, sync, log, {
