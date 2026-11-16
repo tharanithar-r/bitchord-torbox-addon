@@ -1,0 +1,48 @@
+# TorBox Lossless — BitChord addon
+#
+#   addon  : the Node server. Bound to the compose network only; nothing is
+#            published, so the only way in is through Caddy over HTTPS.
+#   caddy  : TLS + reverse proxy on 80/443. This is what makes the addon URL
+#            HTTPS, which is the protocol's one hard deployment requirement.
+#
+# Secrets live in .env (gitignored, chmod 600) and never in this file.
+
+services:
+  addon:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PORT: "8099"
+      BIND_HOST: "0.0.0.0"
+      DB_PATH: "/data/index.db"
+    volumes:
+      - addon-data:/data
+    expose:
+      - "8099"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8099/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - addon
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      ADDON_DOMAIN: "${ADDON_DOMAIN:?set ADDON_DOMAIN in .env (or the shell) to the addon hostname}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  addon-data:
+  caddy-data:
+  caddy-config:

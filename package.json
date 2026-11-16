@@ -1,0 +1,29 @@
+{
+  "name": "bitchord-torbox-addon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "BitChord addon that streams lossless and Dolby Atmos audio held in a TorBox account",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "build": "tsc -p tsconfig.json && node -e \"require('node:fs').cpSync('vendor','dist/vendor',{recursive:true})\"",
+    "start": "node dist/src/main.js",
+    "probe": "tsx scripts/probe.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "fastify": "^5.12.8",
+    "pino": "^10.4.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.0"
+  }
+}
