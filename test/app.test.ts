@@ -452,6 +452,54 @@ describe('signed media route (MEDIA_PROXY=1)', () => {
   });
 });
 
+describe('auth observation never costs the response', () => {
+  it('does not verify the manifest, which BitChord reads before it has a token', async () => {
+    const store = seededStore();
+    let observed = 0;
+    const counting: AuthObserver = {
+      observe: async () => {
+        observed += 1;
+        return { ok: false, code: 'missing' };
+      },
+      counters: () => ({ total: 0, ok: 0, byCode: {} }),
+    };
+    const app = createApp({
+      cfg: config(),
+      store,
+      log: createLogger('silent'),
+      auth: counting,
+      torbox: fakeTorbox(),
+    });
+    const response = await app.inject({ method: 'GET', url: `/${SECRET}/manifest.json` });
+    expect(response.statusCode).toBe(200);
+    expect(observed).toBe(0);
+    await app.close();
+    store.close();
+  });
+
+  it('answers anyway when the verifier stalls on a key fetch', async () => {
+    const store = seededStore();
+    const stalled: AuthObserver = {
+      observe: () => new Promise(() => {}), // like a JWKS fetch that never returns
+      counters: () => ({ total: 0, ok: 0, byCode: {} }),
+    };
+    const app = createApp({
+      cfg: config(),
+      store,
+      log: createLogger('silent'),
+      auth: stalled,
+      torbox: fakeTorbox(),
+      authTimeoutMs: 50,
+    });
+    const began = Date.now();
+    const response = await app.inject({ method: 'GET', url: `/${SECRET}/search?q=midnight` });
+    expect(response.statusCode).toBe(200);
+    expect(Date.now() - began).toBeLessThan(1500);
+    await app.close();
+    store.close();
+  });
+});
+
 describe('matching the recording BitChord asked for', () => {
   function twoVersions(): Store {
     const store = seededStore();

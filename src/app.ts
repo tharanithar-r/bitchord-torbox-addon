@@ -8,7 +8,7 @@ import Fastify, {
 } from 'fastify';
 import type { Logger } from 'pino';
 import type { Acquisition } from './acquire/queue.js';
-import type { AuthObserver } from './auth/bitchord.js';
+import type { AuthObservation, AuthObserver } from './auth/bitchord.js';
 import type { Config } from './config.js';
 import type { Store } from './db.js';
 import { CORS_HEADERS, htmlBody, jsonBody } from './http.js';
@@ -43,6 +43,8 @@ export type AppDeps = {
   sync?: Sync;
   /** Injected so the media route can be tested without a network. */
   fetchImpl?: typeof fetch;
+  /** How long a response may wait for the (log-only) auth observation. */
+  authTimeoutMs?: number;
 };
 
 /** The miss wording `resolveStream` uses, so the retry hint can be attached to it. */
@@ -73,9 +75,36 @@ export function createApp(deps: AppDeps): FastifyInstance {
    * and desktop apps must keep working. Preflight is answered before anything else
    * so a browser never has to satisfy the verifier.
    */
+  const authTimeoutMs = deps.authTimeoutMs ?? 1200;
+
+  /** Paths that are public by the protocol, or not the protocol at all. */
+  const isPublicPath = (url: string): boolean => {
+    const path = url.split('?')[0] ?? url;
+    return path === '/' || path.endsWith('/manifest.json') || path.endsWith('/health');
+  };
+
   app.addHook('onRequest', async (request, reply) => {
     if (request.method === 'OPTIONS') return reply.code(204).headers(CORS_HEADERS).send();
-    const observation = await deps.auth.observe({ headers: request.headers as Record<string, unknown> });
+
+    if (isPublicPath(request.url)) {
+      // The manifest is read before a token exists, so verifying it is pointless —
+      // and the verifier's first call fetches BitChord's keys over the network,
+      // which was adding 1.6 s to a static document.
+      deps.log.info(
+        { method: request.method, url: redactUrl(request.url, deps.cfg.pathSecret), auth: 'public' },
+        'request',
+      );
+      return;
+    }
+
+    // Log-only auth must never hold a response: race the observation against a
+    // ceiling, so a stalled key fetch costs one log line instead of a request.
+    const observation = await Promise.race([
+      deps.auth.observe({ headers: request.headers as Record<string, unknown> }),
+      new Promise<AuthObservation>((resolve) =>
+        setTimeout(() => resolve({ ok: false, code: 'slow' }), authTimeoutMs).unref(),
+      ),
+    ]);
     deps.log.info(
       {
         method: request.method,
@@ -140,13 +169,14 @@ export function createApp(deps: AppDeps): FastifyInstance {
       const atmosWanted = /^(auto|1|true|on)$/i.test(request.query.atmos ?? '');
 
       let rows = deps.store.searchTracks(tokens, 60);
+      let acquired = 0;
 
       // The one path that makes Home-screen playback work: a row has to exist
       // before BitChord will ask for a stream, so an empty search tries to
       // acquire the album itself (cached-only, deadline-bounded).
       if (rows.length === 0 && deps.acquisition) {
-        const indexed = await deps.acquisition.acquireInline(query);
-        if (indexed > 0) rows = deps.store.searchTracks(tokens, 60);
+        acquired = await deps.acquisition.acquireInline(query);
+        if (acquired > 0) rows = deps.store.searchTracks(tokens, 60);
       }
 
       const ranked = rankRows(rows, tier, atmosWanted, tokens).slice(0, 30);
@@ -160,8 +190,18 @@ export function createApp(deps: AppDeps): FastifyInstance {
             : undefined,
         ),
       );
-      deps.log.debug(
-        { query, tokens, tier, atmosWanted, candidates: rows.length, offered: tracks.length },
+      // The query is the one thing a Home-screen diagnosis needs: without it the
+      // log says a search happened but not what was asked for.
+      deps.log.info(
+        {
+          q: query,
+          tokens,
+          tier,
+          atmos: atmosWanted,
+          indexed: rows.length,
+          offered: tracks.length,
+          acquired,
+        },
         'search',
       );
       return send(reply, jsonBody({ tracks }));
@@ -210,6 +250,11 @@ export function createApp(deps: AppDeps): FastifyInstance {
       // answer with no URL and asks again while the track plays; releases that
       // predate it ignore the field, and a 404 is not cached either way, so the
       // next play asks again regardless.
+      deps.log.info(
+        { id: request.params.id, status: answer.status, url: answer.body.url ? 'minted' : 'none' },
+        'stream',
+      );
+
       if (answer.status === 404 && deps.acquisition && answer.body.error === NOT_HELD) {
         answer.body = {
           ...answer.body,
