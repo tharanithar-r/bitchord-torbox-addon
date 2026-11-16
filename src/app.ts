@@ -79,6 +79,25 @@ export function createApp(deps: AppDeps): FastifyInstance {
     return;
   });
 
+  /**
+   * Status and latency for every answer.
+   *
+   * Without this the logs say a request arrived but not what came of it, which is
+   * useless for "the app spins forever" — the interesting question is always
+   * "200 in 12 ms" or "502 in 15 s".
+   */
+  app.addHook('onResponse', async (request, reply) => {
+    deps.log.info(
+      {
+        method: request.method,
+        url: redactUrl(request.url, deps.cfg.pathSecret),
+        status: reply.statusCode,
+        ms: Math.round(reply.elapsedTime),
+      },
+      'response',
+    );
+  });
+
   const send = (reply: FastifyReply, payload: { status: number; headers: Record<string, string>; body: string }) =>
     reply.code(payload.status).headers(payload.headers).send(payload.body);
 

@@ -4,7 +4,9 @@ import type { AuthObserver } from '../src/auth/bitchord.js';
 import type { Config } from '../src/config.js';
 import { Store, trackId } from '../src/db.js';
 import { createLogger } from '../src/log.js';
+import type { Prober } from '../src/probe/worker.js';
 import type { TorBoxClient } from '../src/torbox.js';
+import { codecFromFormat } from '../src/routes/stream.js';
 
 const SECRET = 'test-secret-0123456789';
 
@@ -252,6 +254,46 @@ describe('stream', () => {
     expect(response.statusCode).toBe(503);
     await app.close();
     store.close();
+  });
+});
+
+describe('stream latency and declarations', () => {
+  it('answers immediately instead of waiting for a slow header read', async () => {
+    const store = seededStore();
+    let started = 0;
+    const slowProber = {
+      probe: () => {
+        started += 1;
+        return new Promise(() => {}); // never settles, like a stalled CDN read
+      },
+    } as unknown as Prober;
+    const app = createApp({
+      cfg: config(),
+      store,
+      log: createLogger('silent'),
+      auth: stubAuth(),
+      torbox: fakeTorbox(),
+      prober: slowProber,
+    });
+    const began = Date.now();
+    // t:1:3 is the unprobed row in the fixture.
+    const response = await app.inject({
+      method: 'GET',
+      url: `/${SECRET}/stream/${encodeURIComponent(trackId('torrents', 1, 3))}?quality=max`,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(Date.now() - began).toBeLessThan(1000);
+    expect(started).toBe(1); // the probe was kicked off, not awaited
+    await app.close();
+    store.close();
+  });
+
+  it('declares no codec for an m4a it has not opened', () => {
+    expect(codecFromFormat('flac')).toBe('flac');
+    expect(codecFromFormat('wav')).toBe('wav');
+    // AAC or ALAC — only the file settles it, so nothing is claimed.
+    expect(codecFromFormat('m4a')).toBeUndefined();
+    expect(codecFromFormat('unknown', true)).toBe('flac');
   });
 });
 

@@ -66,19 +66,23 @@ export async function resolveStream(
   }
 
   if (track.probedAt === null && deps.prober) {
-    const ok = await deps.prober.probe(track);
-    const refreshed = deps.store.getTrack(id);
-    if (refreshed) track = refreshed;
-    if (!ok) deps.log.debug({ id }, 'probe did not settle this file');
-    if (!track.playable) {
-      return { status: 404, headers: {}, body: { error: `Cannot play ${track.codec ?? track.format}` } };
-    }
+    // Never block the player on a header read. Probing costs a link mint plus a
+    // ranged fetch — up to fifteen seconds on a slow CDN — and the player shows that
+    // whole wait as "loading". So the probe is started and left to finish: this
+    // answer describes the file from its extension, and the next play is measured.
+    void deps.prober.probe(track).catch((error: unknown) => {
+      deps.log.debug({ id, err: String(error).slice(0, 120) }, 'inline probe failed');
+    });
   }
 
   let url = cachedLink(deps.cache, track.id);
   if (!url) {
     try {
       url = await deps.torbox.requestLink(track.kind, track.itemId, track.fileId);
+      if (!url.startsWith('https://')) {
+        // Android blocks cleartext HTTP, which reaches the player as a silent stall.
+        deps.log.warn({ id, host: safeHost(url) }, 'TorBox returned a non-HTTPS link');
+      }
       deps.cache.set(track.id, { url, at: Date.now() });
     } catch (error) {
       if (error instanceof TorBoxError) {
@@ -106,13 +110,15 @@ function cachedLink(cache: LinkCache, id: string): string | null {
 
 /** The `/stream` answer, with the routing fields filled in from measurements. */
 export function streamBody(track: TrackRow, url: string): Record<string, unknown> {
-  const codec = track.codec ?? (track.lossless ? 'flac' : track.format);
+  const codec = track.codec ?? codecFromFormat(track.format, track.lossless);
   const body: Record<string, unknown> = {
     url,
     format: track.atmos ? 'eac3-joc' : track.format,
     quality: qualityLabel(track),
-    codec,
-    container: track.container ?? containerFor(codec, track.format),
+    // Omitted entirely when nothing can name it — an absent codec is "unknown",
+    // which is honest; a wrong one is what breaks selection.
+    ...(codec ? { codec } : {}),
+    container: track.container ?? containerFor(codec ?? track.format, track.format),
     manifest: 'none',
     encrypted: false,
     // TorBox keeps a link open for three hours to start a transfer; advertising
@@ -127,6 +133,35 @@ export function streamBody(track: TrackRow, url: string): Record<string, unknown
   }
   if (track.isrc) body.isrc = track.isrc;
   return body;
+}
+
+/**
+ * The codec an extension can name on its own.
+ *
+ * `m4a` deliberately yields `undefined`: it is AAC or ALAC and only the file
+ * settles which, so claiming one would be the "lossless label on a lossy URL" the
+ * docs warn about.
+ */
+export function codecFromFormat(format: string, lossless = false): string | undefined {
+  switch (format) {
+    case 'flac':
+    case 'alac':
+    case 'wav':
+    case 'aiff':
+    case 'ape':
+    case 'wv':
+    case 'dsf':
+    case 'dff':
+    case 'mp3':
+    case 'aac':
+    case 'ogg':
+    case 'opus':
+      return format;
+    case 'm4a':
+      return undefined;
+    default:
+      return lossless ? 'flac' : undefined;
+  }
 }
 
 export function containerFor(codec: string, format: string): string {
@@ -150,6 +185,14 @@ export function containerFor(codec: string, format: string): string {
       return 'ogg';
     default:
       return format === 'unknown' ? 'unknown' : format;
+  }
+}
+
+function safeHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return 'unparseable';
   }
 }
 
