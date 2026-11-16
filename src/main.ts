@@ -46,12 +46,19 @@ async function main(): Promise<void> {
   const app = createApp({ cfg, store, log, auth, torbox, prober, acquisition, sync });
 
   await app.listen({ port: cfg.port, host: cfg.bindHost });
+  // Every effective setting that is not a secret, so "did my env apply?" is
+  // answerable from the deploy log instead of from the code.
   log.info(
     {
       addonUrlTemplate: `https://${cfg.publicHosts[0] ?? 'localhost'}/<PATH_SECRET>`,
       hosts: cfg.publicHosts,
       db: cfg.dbPath,
+      port: cfg.port,
       acquire: cfg.acquire,
+      probe: cfg.probe,
+      media: { proxy: cfg.media.proxy, ttlSeconds: cfg.media.ttlSeconds },
+      syncIntervalMinutes: cfg.syncIntervalMinutes,
+      torboxKey: cfg.torboxKey ? 'set' : 'missing',
     },
     'addon listening',
   );
