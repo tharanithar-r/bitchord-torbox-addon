@@ -87,6 +87,46 @@ describe('inline acquisition from a search', () => {
     store.close();
   });
 
+  it('re-indexes a release that was added while still downloading', async () => {
+    const store = Store.open(':memory:');
+    // An uncached add: queued, accepted by TorBox, files not there yet.
+    store.enqueue({ hash: 'b'.repeat(40), name: 'Album [FLAC]', seeders: 20 });
+    store.updateQueue('b'.repeat(40), {
+      state: 'added',
+      itemKind: 'torrents',
+      itemId: 77,
+      note: 'uncached, downloading',
+    });
+
+    let indexed = 0;
+    const sync = { syncItem: async () => (indexed += 4) && 4 } as unknown as Sync;
+    const acquisition = new Acquisition(store, {} as TorBoxClient, sync, createLogger('silent'), cfg());
+
+    // Older than the refresh window (the row was just written, so push it back).
+    (store as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } } }).db
+      .prepare('UPDATE queue SET updated_at = updated_at - 600')
+      .run();
+
+    await expect(acquisition.refreshInflight()).resolves.toBe(4);
+    expect(store.recentQueue(1)[0]?.note).toContain('ready');
+    store.close();
+  });
+
+  it('leaves an in-flight release alone while it is still downloading', async () => {
+    const store = Store.open(':memory:');
+    store.enqueue({ hash: 'c'.repeat(40), name: 'Album [FLAC]', seeders: 20 });
+    store.updateQueue('c'.repeat(40), { state: 'added', itemKind: 'torrents', itemId: 88 });
+    const sync = { syncItem: async () => 0 } as unknown as Sync;
+    const acquisition = new Acquisition(store, {} as TorBoxClient, sync, createLogger('silent'), cfg());
+    (store as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } } }).db
+      .prepare('UPDATE queue SET updated_at = updated_at - 600')
+      .run();
+
+    await expect(acquisition.refreshInflight()).resolves.toBe(0);
+    expect(store.recentQueue(1)[0]?.state).toBe('added');
+    store.close();
+  });
+
   it('does nothing when acquisition is switched off', async () => {
     const store = Store.open(':memory:');
     const acquisition = new Acquisition(

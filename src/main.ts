@@ -112,6 +112,9 @@ async function main(): Promise<void> {
         const outcome = await acquisition.processOne();
         if (outcome === 'empty' || outcome === 'budget' || outcome === 'skipped') break;
       }
+      // A release added while still downloading becomes searchable here, not at
+      // the next library walk.
+      await acquisition.refreshInflight();
     } catch (error) {
       log.warn({ err: (error as Error).message }, 'acquisition loop failed');
     } finally {

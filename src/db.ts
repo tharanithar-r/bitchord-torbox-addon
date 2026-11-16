@@ -547,6 +547,42 @@ export class Store {
       );
   }
 
+  /**
+   * Added releases whose files may not have been indexable yet.
+   *
+   * An uncached add returns before the download finishes, so the item exists with
+   * no usable files. These are re-synced on a timer until they yield tracks —
+   * otherwise a freshly downloaded album would only appear on the next full
+   * library walk, up to `SYNC_INTERVAL_MINUTES` later.
+   */
+  queueInflight(olderThanSeconds: number, limit = 3): QueueRow[] {
+    const cutoff = Math.floor(Date.now() / 1000) - olderThanSeconds;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM queue
+          WHERE state = 'added' AND item_id IS NOT NULL AND updated_at <= ?
+          ORDER BY updated_at LIMIT ?`,
+      )
+      .all(cutoff, limit) as Raw[];
+    return rows.map((raw) => ({
+      hash: String(raw.hash),
+      name: String(raw.name ?? ''),
+      sizeBytes: raw.size_bytes == null ? null : Number(raw.size_bytes),
+      seeders: raw.seeders == null ? null : Number(raw.seeders),
+      source: raw.source == null ? null : String(raw.source),
+      artist: raw.artist == null ? null : String(raw.artist),
+      album: raw.album == null ? null : String(raw.album),
+      wantedTitle: raw.wanted_title == null ? null : String(raw.wanted_title),
+      state: String(raw.state) as QueueRow['state'],
+      attempts: Number(raw.attempts ?? 0),
+      itemKind: raw.item_kind == null ? null : (String(raw.item_kind) as Kind),
+      itemId: raw.item_id == null ? null : Number(raw.item_id),
+      createdAt: Number(raw.created_at ?? 0),
+      updatedAt: Number(raw.updated_at ?? 0),
+      note: raw.note == null ? null : String(raw.note),
+    }));
+  }
+
   nextQueue(): QueueRow | null {
     const raw = this.db
       .prepare(

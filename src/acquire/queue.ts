@@ -39,6 +39,12 @@ export type AcquireDeps = {
   search?: (query: string, options?: IndexerOptions) => Promise<Release[]>;
 };
 
+function allowUncachedNote(allowUncached: boolean): string {
+  return allowUncached
+    ? 'worker: skipped a release that is no longer cached'
+    : 'worker: skipped (ACQUIRE_UNCACHED=0, so only cached releases are added)';
+}
+
 export class Acquisition {
   /** Timestamps of every add this process has made, for the hourly ceiling. */
   private adds: number[] = [];
@@ -90,11 +96,19 @@ export class Acquisition {
         log: this.log,
       });
       const candidates = releases.slice(0, 3);
-      if (candidates.length === 0) return 0;
+      if (candidates.length === 0) {
+        this.log.info({ query, releases: 0 }, 'inline acquire: no release found');
+        return 0;
+      }
 
       const cached = await this.torbox.checkCached(
         candidates.map((release) => release.hash),
         { kind: 'torrents' },
+      );
+      const cachedCount = candidates.filter((release) => cached[release.hash]).length;
+      this.log.info(
+        { query, releases: candidates.length, cached: cachedCount, names: candidates.map((r) => r.name.slice(0, 60)) },
+        'inline acquire: candidates',
       );
 
       for (const release of candidates) {
@@ -168,7 +182,10 @@ export class Acquisition {
     if (!this.cfg.enabled) return 'skipped';
     const row = this.store.nextQueue();
     if (!row) return 'empty';
-    if (this.budgetLeft() <= 0) return 'budget';
+    if (this.budgetLeft() <= 0) {
+      this.log.info({ queued: row.name.slice(0, 60) }, 'worker: hourly add budget spent');
+      return 'budget';
+    }
 
     const magnet = magnetFor(row.hash, row.name);
     try {
@@ -182,6 +199,10 @@ export class Acquisition {
             attempts: row.attempts + 1,
             note: 'not cached on TorBox',
           });
+          this.log.info(
+            { hash: row.hash, allowUncached: this.cfg.allowUncached, seeders: row.seeders },
+            allowUncachedNote(this.cfg.allowUncached),
+          );
           return 'skipped';
         }
         const added = await this.torbox.addTorrent(magnet, { onlyIfCached: false, name: row.name });
@@ -221,6 +242,32 @@ export class Acquisition {
       this.log.warn({ hash: row.hash, err: message }, 'acquisition failed');
       return 'failed';
     }
+  }
+
+  /**
+   * Re-index releases that were added while still downloading.
+   *
+   * An uncached add returns as soon as TorBox accepts it; the files appear once
+   * the transfer is done, which is minutes later. Re-syncing (rather than trusting
+   * one attempt) is what turns "queued" into "searchable" without waiting for the
+   * next full library walk.
+   */
+  async refreshInflight(limit = 3): Promise<number> {
+    let ready = 0;
+    for (const row of this.store.queueInflight(120, limit)) {
+      if (row.itemKind === null || row.itemId === null) continue;
+      try {
+        const indexed = await this.sync.syncItem(row.itemKind, row.itemId);
+        if (indexed > 0) {
+          this.store.updateQueue(row.hash, { note: `ready, ${indexed} tracks indexed` });
+          this.log.info({ hash: row.hash, indexed }, 'in-flight release is ready');
+          ready += indexed;
+        }
+      } catch (error) {
+        this.log.debug({ hash: row.hash, err: (error as Error).message.slice(0, 100) }, 'in-flight sync failed');
+      }
+    }
+    return ready;
   }
 
   /** How many adds remain in the rolling hour. */
